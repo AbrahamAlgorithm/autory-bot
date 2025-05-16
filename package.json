@@ -1,0 +1,19 @@
+{
+  "name": "autory-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "@types/xlsx": "^0.0.35",
+    "dotenv": "^16.5.0",
+    "puppeteer": "^24.8.2",
+    "xlsx": "^0.18.5"
+  }
+}
