@@ -35,7 +35,7 @@ class ExportService {
       XLSX.utils.book_append_sheet(workbook, worksheet, 'Applications');
 
       // Generate filename with timestamp
-      const fileName = `applications_${new Date().toISOString().split('T')[0]}.xlsx`;
+      const fileName = `applications.xlsx`;
       
       // Write to file
       XLSX.writeFile(workbook, fileName);

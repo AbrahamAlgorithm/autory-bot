@@ -1,6 +1,8 @@
 const puppeteer = require('puppeteer');
 const supabase = require('../lib/supabaseClient');
 const { timeout } = require('puppeteer');
+const XLSX = require('xlsx');
+const path = require('path');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -57,33 +59,21 @@ async function searchJobs(page, jobTitle, jobLocation) {
   }
 }
 
-async function applyJobs(page) {
+async function applyJobs(page, application) {  // Add application parameter
   try {
-    console.log('Starting job applications...');
-
-    // // Wait for job list to load
-    // await page.waitForSelector('ul.YdifWvHhBvBLKVsIfxxTNXHfIrEvRavSUbweYDo', {
-    //   visible: true,
-    //   timeout: 30000
-    // });
-
-    // Get all job items
+    // Get all job 
     const jobItems = await page.$$('li.occludable-update');
     console.log(`Found ${jobItems.length} jobs`);
 
     for (let i = 0; i < jobItems.length; i++) {
       try {
-        // Click the job item
         console.log(`Clicking job #${i + 1}`);
         await jobItems[i].evaluate(node => {
           const clickable = node.querySelector('a, button, [role="button"]') || node;
           clickable.click();
         });
-
-        // Wait for job details to load
         await delay(2000);
 
-        // Look for Easy Apply button
         const applyButton = await page.waitForSelector('button#jobs-apply-button-id', {
           visible: true,
           timeout: 10000
@@ -93,23 +83,17 @@ async function applyJobs(page) {
           console.log('Easy Apply button found, clicking it');
           await applyButton.click();
 
-          // Wait for application modal
           await delay(2000);
 
-          // Check for submit button
-          const submitButton = await page.$('button[aria-label="Submit application"]');
-          if (submitButton) {
-            await submitButton.click();
-            console.log('Application submitted');
-            await delay(2000);
-          }
+        const success = await fillForm(page, application);
 
-          // Close any modal if present
-          const closeButton = await page.$('button[aria-label="Dismiss"]');
-          if (closeButton) {
-            await closeButton.click();
-            await delay(1000);
-          }
+        if (success) {
+            console.log("✅ Application submitted successfully.");
+            // Optionally update Supabase with status: "applied"
+        } else {
+            console.log("⚠️ Application failed/skipped.");
+            // Optionally update status: "failed"
+        }
         }
 
       } catch (error) {
@@ -126,19 +110,142 @@ async function applyJobs(page) {
   }
 }
 
-async function loginToLinkedin() {
-  try {
-    const { data: application, error } = await supabase
-      .from('applications')
-      .select('linkedin_email, linkedin_password, job_title, job_location')
-      .not('linkedin_email', 'is', null)
-      .not('linkedin_password', 'is', null)
-      .limit(1)
-      .single();
+function decideInputValue(label, application) {
+  label = label.toLowerCase();
 
-    if (error || !application) {
+  if (label.includes('first name')) return application.first_name;
+  if (label.includes('last name')) return application.last_name;
+  if (label.includes('phone')) return application.phone_number;
+  if (label.includes('location')) return application.job_location;
+  if (label.includes('years')) return application.relevant_experience;
+  if (label.includes('ctc')) return application.current_ctc;
+  if (label.includes('expected')) return application.expected_ctc;
+  if (label.includes('notice')) return application.notice_period;
+  if (label.includes('linkedin')) return application.linkedin_url;
+  if (label.includes('email')) return null; // Let LinkedIn handle it
+
+  // Fallbacks
+  if (label.includes('why') || label.includes('describe') || label.includes('reason')) return 'N/A';
+  if (label.includes('how many') || label.includes('number')) return '1';
+  if (label.includes('authorized') || label.includes('eligible') || label.includes('sponsorship')) return 'Yes';
+  if (label.includes('currently working') || label.includes('employed')) return 'Yes';
+  if (label.includes('willing') && label.includes('relocate')) return 'Yes';
+
+  return 'N/A';
+}
+
+async function fillForm(page, application) {
+  try {
+    console.log('📝 Starting to fill form...');
+
+    let step = 1;
+
+    while (true) {
+      console.log(`🔁 Step ${step}...`);
+
+      // Wait for the form to be visible
+      await page.waitForSelector('form', { timeout: 5000 });
+
+      // Get all required input fields
+      const inputs = await page.$$('form input[required]');
+
+      for (const input of inputs) {
+        const id = await input.evaluate(el => el.id);
+        const label = await page.evaluate((id) => {
+          const labelEl = document.querySelector(`label[for="${id}"]`);
+          return labelEl ? labelEl.innerText : '';
+        }, id);
+
+        if (!label) continue;
+
+        const fillValue = decideInputValue(label, application);
+
+        if (fillValue) {
+          await input.evaluate(el => el.value = '');
+          await input.focus();
+          await delay(100);
+          await input.type(fillValue.toString(), { delay: 20 });
+          console.log(`✅ Filled "${label}" with "${fillValue}"`);
+        } else {
+          console.log(`⚠️ Skipped "${label}"`);
+        }
+      }
+
+      // Wait for LinkedIn to process any input changes
+      await delay(1000);
+
+      // Check for buttons in order of form flow
+      const nextBtn = await page.$('button[aria-label="Continue to next step"]');
+      const reviewBtn = await page.$('button[aria-label="Review your application"]');
+      const submitBtn = await page.$('button[aria-label="Submit application"]');
+
+      if (nextBtn) {
+        await nextBtn.click();
+        console.log("➡️ Clicked 'Next'");
+        await delay(1500);
+        step++;
+        continue;
+      } else if (reviewBtn) {
+        await reviewBtn.click();
+        console.log("🔍 Clicked 'Review'");
+        await delay(1500);
+        step++;
+        continue;
+      } else if (submitBtn) {
+        await submitBtn.click();
+        console.log("✅ Clicked 'Submit Application'");
+        await delay(1500);
+        break;
+      } else {
+        console.log("⛔ No navigation buttons found. Possibly stuck.");
+        break;
+      }
+    }
+
+    console.log("🎉 Form filled and submitted.");
+    await delay(2000);
+      const dismissButton = await page.$('button[aria-label="Dismiss"][data-test-modal-close-btn]');
+      if (dismissButton) {
+        await dismissButton.click();
+        console.log("🔒 Closed success popup");
+        await delay(1000);
+      }
+    return true;
+
+
+  } catch (err) {
+    console.error("❌ Error filling form:", err.message);
+    return false;
+  }
+}
+
+async function getApplicationData() {
+  try {
+    const workbook = XLSX.readFile(path.join(__dirname, '..', 'applications.xlsx'));
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const applications = XLSX.utils.sheet_to_json(worksheet);
+
+    // Get first application that has LinkedIn credentials
+    const application = applications.find(app => 
+      app.linkedin_email && 
+      app.linkedin_password
+    );
+
+    if (!application) {
       throw new Error('No application with LinkedIn credentials found');
     }
+
+    return application;
+  } catch (error) {
+    console.error('Error reading Excel file:', error);
+    throw error;
+  }
+}
+
+async function loginToLinkedin() {
+  try {
+    const application = await getApplicationData();
 
     const browser = await puppeteer.launch({
       headless: false,
@@ -187,11 +294,8 @@ async function loginToLinkedin() {
 
     await searchJobs(page, application.job_title, application.job_location);
 
-    console.log('Waiting for 1 minute on search results page...');
-    await delay(2000);
-
     console.log('Starting job applications...');
-    await applyJobs(page);
+    await applyJobs(page, application);  // Pass application data
 
     console.log('Closing browser...');
     await browser.close();
@@ -204,7 +308,6 @@ async function loginToLinkedin() {
     throw error;
   }
 }
-// ...existing code...
 
 // Runs the script
 loginToLinkedin()
