@@ -45,7 +45,6 @@ async function searchJobs(page, jobTitle, jobLocation) {
     console.log('Waiting for search results...');
     await delay(3000);
 
-    // filter the search to easyapply
     await page.click('button[aria-label="Easy Apply filter."]');
     await delay(2000);
     console.log('Clicked the easy apply button')
@@ -59,7 +58,7 @@ async function searchJobs(page, jobTitle, jobLocation) {
   }
 }
 
-async function applyJobs(page, application) {  // Add application parameter
+async function applyJobs(page, application) {
   try {
     // Get all job 
     const jobItems = await page.$$('li.occludable-update');
@@ -89,10 +88,8 @@ async function applyJobs(page, application) {  // Add application parameter
 
         if (success) {
             console.log("✅ Application submitted successfully.");
-            // Optionally update Supabase with status: "applied"
         } else {
             console.log("⚠️ Application failed/skipped.");
-            // Optionally update status: "failed"
         }
         }
 
@@ -118,14 +115,37 @@ function decideInputValue(label, application) {
   if (label.includes('phone')) return application.phone_number;
   if (label.includes('location')) return application.job_location;
   if (label.includes('years')) return application.relevant_experience;
+  if (label.includes('experience')) return application.total_experience;
+  if (label.includes('current location')) return application.current_location;
+  if (label.includes('preferred location')) return application.preferred_location;
+  if (label.includes('Street address')) return application.current_location;
+  if (label.includes('country')) return application.current_location;
+  if (label.includes('state')) return application.current_location;
+  if (label.includes('zip') || label.includes('postal')) return application.postal_code;
+  if (label.includes('country code')) return application.phone_country_code;
+  if (label.includes('city')) return application.city;
   if (label.includes('ctc')) return application.current_ctc;
   if (label.includes('expected')) return application.expected_ctc;
+  if (label.includes('current') && label.includes('compensation')) return application.current_ctc;
+  if (label.includes('current salary (gross)')) return application.current_ctc;
+  if (label.includes('expected salary (gross)')) return application.expected_ctc;
+  if (label.includes('current salary')) return application.current_ctc;
+  if (label.includes('salary')) return application.expected_ctc;
+  if (label.includes('total experience')) return application.total_experience;
+  if (label.includes('relevant experience')) return application.relevant_experience;
+  if (label.includes('notice period')) return application.notice_period;
   if (label.includes('notice')) return application.notice_period;
   if (label.includes('linkedin')) return application.linkedin_url;
-  if (label.includes('email')) return null; // Let LinkedIn handle it
+  if (label.includes('linkedin profile')) return application.linkedin_url;
+  if (label.includes('cover letter')) return application.cover_letter;
+  if (label.includes('onsite')) return 'Yes';
+  if (label.includes('remote')) return 'Yes';
+  if (label.includes('hybrid')) return 'Yes';
+  if (label.includes('email')) return null;
 
   // Fallbacks
-  if (label.includes('why') || label.includes('describe') || label.includes('reason')) return 'N/A';
+  if (label.includes('why') || label.includes('describe') || label.includes('reason')) return '1';
+  if (label.includes('what') || label.includes('salary expectation') || label.includes('current compensation')) return application.expected_ctc;
   if (label.includes('how many') || label.includes('number')) return '1';
   if (label.includes('authorized') || label.includes('eligible') || label.includes('sponsorship')) return 'Yes';
   if (label.includes('currently working') || label.includes('employed')) return 'Yes';
@@ -134,19 +154,43 @@ function decideInputValue(label, application) {
   return 'N/A';
 }
 
+
 async function fillForm(page, application) {
   try {
     console.log('📝 Starting to fill form...');
-
     let step = 1;
 
     while (true) {
       console.log(`🔁 Step ${step}...`);
 
-      // Wait for the form to be visible
-      await page.waitForSelector('form', { timeout: 5000 });
+      // Handle radio buttons first - Always select "Yes"
+      const yesRadios = await page.$$('input[data-test-text-selectable-option__input="Yes"]');
+      for (const radio of yesRadios) {
+        try {
+          await radio.click();
+          console.log('✅ Selected "Yes" for radio option');
+          await delay(300);
+        } catch (error) {
+          console.warn('⚠️ Failed to click radio button:', error.message);
+        }
+      }
 
-      // Get all required input fields
+      // Handle dropdowns - Always select "Yes"
+      const dropdowns = await page.$$('select[data-test-text-entity-list-form-select]');
+      for (const dropdown of dropdowns) {
+        try {
+          await page.evaluate(select => {
+            select.value = 'Yes';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+          }, dropdown);
+          console.log('✅ Selected "Yes" for dropdown');
+          await delay(300);
+        } catch (error) {
+          console.warn('⚠️ Failed to set dropdown value:', error.message);
+        }
+      }
+
+      // Handle required inputs
       const inputs = await page.$$('form input[required]');
 
       for (const input of inputs) {
@@ -158,16 +202,14 @@ async function fillForm(page, application) {
 
         if (!label) continue;
 
-        const fillValue = decideInputValue(label, application);
+        const fillValue = await decideInputValue(label, application);  // Note the await here
 
         if (fillValue) {
           await input.evaluate(el => el.value = '');
           await input.focus();
           await delay(100);
           await input.type(fillValue.toString(), { delay: 20 });
-          console.log(`✅ Filled "${label}" with "${fillValue}"`);
-        } else {
-          console.log(`⚠️ Skipped "${label}"`);
+          console.log(`✅ Filled "${label}" with AI-generated response`);
         }
       }
 
@@ -226,7 +268,6 @@ async function getApplicationData() {
     const worksheet = workbook.Sheets[sheetName];
     const applications = XLSX.utils.sheet_to_json(worksheet);
 
-    // Get first application that has LinkedIn credentials
     const application = applications.find(app => 
       app.linkedin_email && 
       app.linkedin_password
