@@ -1,8 +1,13 @@
 const puppeteer = require('puppeteer');
 const supabase = require('../lib/supabaseClient');
 const { timeout } = require('puppeteer');
+const MAX_USER_PROCESSING_TIME = 30 * 60 * 1000; 
 const XLSX = require('xlsx');
 const path = require('path');
+const OpenAI = require('openai');
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 const MAX_DAILY_APPLICATIONS = 50;
 const APPLICATION_TIMESTAMP_KEY = 'last_application_date';
@@ -17,6 +22,69 @@ async function typeWithSlowMotion(page, selector, text) {
     await page.type(selector, char, {
       delay: Math.floor(Math.random() * 200) + 100
     });
+  }
+}
+
+async function processAllUsers() {
+  try {
+    const applications = await getApplicationData();
+    console.log(`Found ${applications.length} users to process`);
+
+    for (const application of applications) {
+      console.log(`\n📝 Processing user: ${application.first_name} ${application.last_name}`);
+
+      // Check daily application limit
+      const canApply = await checkDailyLimit(application.user_id);
+      if (!canApply) {
+        console.log(`⚠️ User ${application.first_name} has reached daily limit of ${MAX_DAILY_APPLICATIONS} applications`);
+        continue;
+      }
+
+      let browser;
+      try {
+        const processingPromise = (async () => {
+          browser = await puppeteer.launch({
+            headless: false,
+            slowMo: 50,
+            defaultViewport: null,
+            args: ['--start-maximized']
+          });
+          const page = await browser.newPage();
+          await loginToLinkedin(application, page);
+        })();
+
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error('User processing timeout reached (30 minutes)'));
+          }, MAX_USER_PROCESSING_TIME);
+        });
+
+        await Promise.race([processingPromise, timeoutPromise]);
+        console.log(`✅ Completed processing for ${application.first_name}`);
+
+      } catch (error) {
+        if (error.message.includes('timeout reached')) {
+          console.log(`⏰ Timeout reached for user ${application.first_name}. Moving to next user...`);
+        } else {
+          console.error(`❌ Error processing user ${application.first_name}:`, error);
+        }
+      } finally {
+        if (browser) {
+          try {
+            await browser.close();
+            console.log('Browser closed successfully');
+          } catch (closeError) {
+            console.error('Error closing browser:', closeError);
+          }
+        }
+        await delay(5000); // Wait between users
+      }
+    }
+
+    console.log('\n🎉 Completed processing all users');
+  } catch (error) {
+    console.error('Failed to process users:', error);
+    throw error;
   }
 }
 
@@ -64,23 +132,101 @@ async function searchJobs(page, jobTitle, jobLocation) {
   }
 }
 
+async function isJobTitleRelevant(targetTitle, actualTitle) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{
+        role: "system",
+        content: "You are a job matching expert. Respond with only 'true' or 'false'."
+      }, {
+        role: "user",
+        content: `Is the job title "${actualTitle}" relevant or similar to "${targetTitle}"? Consider job responsibilities and career level. Only respond with true or false.`
+      }],
+      temperature: 0.1,
+      max_tokens: 5
+    });
+
+    const answer = response.choices[0].message.content.toLowerCase().trim();
+    return answer === 'true';
+  } catch (error) {
+    console.error('Error checking job relevancy:', error);
+    return true; // Default to true in case of API error
+  }
+}
+
+async function handlePagination(page, currentPage) {
+  try {
+    // Try first pagination style (artdeco-pagination)
+    try {
+      const nextPageBtn = await page.$(`[data-test-pagination-page-btn="${currentPage + 1}"]`);
+      if (nextPageBtn) {
+        console.log(`Moving to page ${currentPage + 1} (Style 1)`);
+        await nextPageBtn.click();
+        return true;
+      }
+    } catch (error) {
+      console.log('First pagination style not found, trying second style...');
+    }
+
+    // Try second pagination style (jobs-search-pagination)
+    try {
+      const nextButton = await page.$('button.jobs-search-pagination__button--next');
+      if (nextButton) {
+        const isDisabled = await page.evaluate(btn => 
+          btn.classList.contains('artdeco-button--disabled'), nextButton);
+
+        if (!isDisabled) {
+          console.log(`Moving to next page (Style 2)`);
+          await nextButton.click();
+          return true;
+        }
+      }
+    } catch (error) {
+      console.log('Second pagination style not found');
+    }
+
+    console.log('No more pages available in either style');
+    return false;
+
+  } catch (error) {
+    console.warn('Error handling pagination:', error.message);
+    return false;
+  }
+}
+
 async function applyJobs(page, application) {
   try {
-    let applicationCount = 0;
-
     while (true) {
-      // Check if we've hit the daily limit
-      if (applicationCount >= MAX_DAILY_APPLICATIONS) {
-        console.log(`📊 Reached daily limit of ${MAX_DAILY_APPLICATIONS} applications`);
-        break;
-      }
-
       const jobItems = await page.$$('li.occludable-update');
       console.log(`Found ${jobItems.length} total jobs on current page`);
 
       // Process jobs on current page
       for (let i = 0; i < jobItems.length; i++) {
         try {
+          // Check current application count before proceeding
+          const canApply = await checkDailyLimit(application.user_id);
+          if (!canApply) {
+            console.log(`📊 User ${application.first_name} has reached daily limit of ${MAX_DAILY_APPLICATIONS} applications`);
+            return; // Exit the function completely
+          }
+
+          // Get job title before clicking
+          const jobTitle = await jobItems[i].evaluate(node => {
+            const titleEl = node.querySelector('.job-card-list__title--link');
+            return titleEl ? titleEl.textContent.trim() : '';
+          });
+
+          // Check if job is relevant
+          const isRelevant = await isJobTitleRelevant(application.job_title, jobTitle);
+          
+          if (!isRelevant) {
+            console.log(`⏩ Skipping job #${i + 1} - Title "${jobTitle}" not relevant to "${application.job_title}"`);
+            continue;
+          } else {
+            console.log(`✅ Job "${jobTitle}" is relevant to "${application.job_title}", applying...`);
+          }
+
           // Check if job has already been applied to
           const isApplied = await jobItems[i].evaluate(node => {
             const footerText = node.querySelector('.job-card-container__footer-item')?.textContent?.trim();
@@ -140,13 +286,20 @@ async function applyJobs(page, application) {
               } catch (closeError) {
                 console.warn("Could not close dialog:", closeError.message);
               }
+
+              // if there is a discard button, click it
+              const discardButton = await page.$('button[data-control-name="discard_application_confirm_btn"]');
+              if (discardButton) {
+                await discardButton.click();
+                console.log("🔒 Discarded application");
+              }
+              await delay(2000);
+              console.log("⏩ Skipping to next job");
               
               continue;
             }
 
             console.log("✅ Application submitted successfully.");
-            applicationCount++;
-            console.log(`📈 Application count: ${applicationCount}/${MAX_DAILY_APPLICATIONS}`);
           }
 
         } catch (error) {
@@ -158,16 +311,28 @@ async function applyJobs(page, application) {
       // After processing all jobs on current page, handle pagination
       try {
         // Find current page number
-        const currentPage = await page.$eval('.artdeco-pagination__indicator--number.active.selected button span', 
-          el => parseInt(el.textContent));
+        let currentPage;
+        
+        try {
+          // Try first style
+          currentPage = await page.$eval(
+            '.artdeco-pagination__indicator--number.active.selected button span', 
+            el => parseInt(el.textContent)
+          );
+        } catch {
+          // Try second style
+          currentPage = await page.$eval(
+            '.jobs-search-pagination__indicator-button--active span',
+            el => parseInt(el.textContent)
+          );
+        }
+
         console.log(`Currently on page ${currentPage}`);
 
-        // Look for next page button
-        const nextPageBtn = await page.$(`[data-test-pagination-page-btn="${currentPage + 1}"]`);
+        // Handle pagination using new function
+        const hasNextPage = await handlePagination(page, currentPage);
         
-        if (nextPageBtn) {
-          console.log(`Moving to page ${currentPage + 1}`);
-          await nextPageBtn.click();
+        if (hasNextPage) {
           await delay(3000); // Wait for new page to load
           
           // Wait for job list to refresh
@@ -180,7 +345,7 @@ async function applyJobs(page, application) {
           break;
         }
       } catch (paginationError) {
-        console.log('No more pages or pagination error:', paginationError.message);
+        console.log('Pagination error:', paginationError.message);
         break;
       }
     }
@@ -240,6 +405,9 @@ function decideInputValue(label, application) {
   if (label.includes('Notice Period')) return '0';
   if (label.includes('grade') || label.includes('cgpa') || label.includes('4.0 scale') || label.includes('marks')) return '4.0';
   if (label.includes('grade') || label.includes('cgpa') || label.includes('5.0 scale') || label.includes('marks')) return '5.0';
+  if (label.includes('Are you open to work?')) return 'Yes';
+  if (label.includes('Are you open to relocation?')) return 'Yes';
+  if (label.includes('Are you open to remote work?')) return 'Yes';
   if (label.includes('email')) return null;
 
   // Fallbacks
@@ -363,16 +531,24 @@ async function fillForm(page, application) {
           if (appliedText.includes('Applied')) {
             console.log("✅ Application confirmed successful!");
 
-            // Get job details
-            const jobTitle = await page.$eval('.job-details-jobs-unified-top-card__job-title a', el => el.textContent.trim());
-            const jobUrl = page.url();
-            const companyName = await page.$eval('.job-details-jobs-unified-top-card__company-name a', el => el.textContent.trim());
+            // Check limit one final time before recording
+            const canApply = await checkDailyLimit(application.user_id);
+            if (!canApply) {
+              console.log(`⚠️ Daily limit reached during submission. Not recording this application.`);
+              return false;
+            }
 
-            // Log to Supabase with correct user_id
+            // Get job details and insert to Supabase
+            const jobTitle = await page.$eval('.job-details-jobs-unified-top-card__job-title a', 
+              el => el.textContent.trim());
+            const jobUrl = page.url();
+            const companyName = await page.$eval('.job-details-jobs-unified-top-card__company-name a', 
+              el => el.textContent.trim());
+
             const { error } = await supabase
               .from('job_applications')
               .insert({
-                user_id: application.user_id, // Changed from application.id to application.user_id
+                user_id: application.user_id,
                 job_title: jobTitle,
                 job_url: jobUrl,
                 company_name: companyName
@@ -457,17 +633,8 @@ async function checkDailyLimit(userId) {
   }
 }
 
-async function loginToLinkedin(application) {
+async function loginToLinkedin(application, page) {
   try {
-    const browser = await puppeteer.launch({
-      headless: false,
-      slowMo: 50,
-      defaultViewport: null,
-      args: ['--start-maximized']
-    });
-
-    const page = await browser.newPage();
-
     console.log('Navigating to LinkedIn...');
     await page.goto('https://www.linkedin.com/login', {
       waitUntil: 'networkidle0'
@@ -509,9 +676,6 @@ async function loginToLinkedin(application) {
     console.log('Starting job applications...');
     await applyJobs(page, application);  // Pass application data
 
-    console.log('Closing browser...');
-    await browser.close();
-
   } catch (error) {
     console.error('Operation failed:', error);
     if (error.name === 'TimeoutError') {
@@ -521,38 +685,6 @@ async function loginToLinkedin(application) {
   }
 }
 
-async function processAllUsers() {
-  try {
-    const applications = await getApplicationData();
-    console.log(`Found ${applications.length} users to process`);
-
-    for (const application of applications) {
-      console.log(`\n📝 Processing user: ${application.first_name} ${application.last_name}`);
-
-      // Check daily application limit
-      const canApply = await checkDailyLimit(application.user_id);
-      if (!canApply) {
-        console.log(`⚠️ User ${application.first_name} has reached daily limit of ${MAX_DAILY_APPLICATIONS} applications`);
-        continue;
-      }
-
-      try {
-        await loginToLinkedin(application);
-        console.log(`✅ Completed processing for ${application.first_name}`);
-        await delay(5000); // Wait between users
-      } catch (error) {
-        console.error(`❌ Error processing user ${application.first_name}:`, error);
-        continue;
-      }
-    }
-
-    console.log('\n🎉 Completed processing all users');
-  } catch (error) {
-    console.error('Failed to process users:', error);
-  }
-}
-
-// Update the script execution
-processAllUsers()
-  .then(() => console.log('All users processed successfully'))
-  .catch(error => console.error('Script failed:', error));
+module.exports = {
+  processAllUsers
+};
