@@ -44,14 +44,30 @@ async function processAllUsers() {
       try {
         const processingPromise = (async () => {
           browser = await puppeteer.launch({
-            headless: false,
-            slowMo: 50,
-            defaultViewport: null,
-            args: ['--start-maximized']
+            headless: "new", // Use new headless mode
+            defaultViewport: {
+              width: 1920,
+              height: 1080
+            },
+            args: [
+              '--window-size=1920,1080',
+              '--disable-notifications',
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--disable-accelerated-2d-canvas',
+              '--disable-gpu',
+              '--start-maximized'
+            ]
           });
           const page = await browser.newPage();
+          
+          // Set user agent to avoid detection
+          await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+          
           await loginToLinkedin(application, page);
         })();
+
 
         const timeoutPromise = new Promise((_, reject) => {
           setTimeout(() => {
