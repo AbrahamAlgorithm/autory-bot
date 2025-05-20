@@ -1,9 +1,19 @@
 const XLSX = require('xlsx');
 const supabase = require('../lib/supabaseClient');
+const fs = require('fs');
+const path = require('path');
 
 class ExportService {
   async exportApplicationsToExcel() {
+    const fileName = 'applications.xlsx';
+    
     try {
+      // Delete existing file if it exists
+      if (fs.existsSync(fileName)) {
+        fs.unlinkSync(fileName);
+        console.log('🗑️ Deleted existing Excel file');
+      }
+
       // Fetch all applications
       const { data: applications, error } = await supabase
         .from('applications')
@@ -33,17 +43,15 @@ class ExportService {
 
       // Add worksheet to workbook
       XLSX.utils.book_append_sheet(workbook, worksheet, 'Applications');
-
-      // Generate filename with timestamp
-      const fileName = `applications.xlsx`;
       
       // Write to file
       XLSX.writeFile(workbook, fileName);
+      console.log('📊 Created new Excel file');
 
       return fileName;
 
     } catch (error) {
-      console.error('Export failed:', error);
+      console.error('❌ Export failed:', error);
       throw error;
     }
   }

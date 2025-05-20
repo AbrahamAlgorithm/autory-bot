@@ -1,0 +1,173 @@
+async function fillForm(page, application) {
+  try {
+    console.log('📝 Starting to fill form...');
+    let step = 1;
+
+    while (true) {
+      console.log(`🔁 Step ${step}...`);
+
+      // Handle radio buttons first - Always select "Yes"
+      const yesRadios = await page.$$('input[data-test-text-selectable-option__input="Yes"]');
+      for (const radio of yesRadios) {
+        try {
+          await radio.click();
+          console.log('✅ Selected "Yes" for radio option');
+          await delay(300);
+        } catch (error) {
+          console.warn('⚠️ Failed to click radio button:', error.message);
+        }
+      }
+
+      // Handle dropdowns - Always select "Yes"
+      const dropdowns = await page.$$('select[data-test-text-entity-list-form-select]');
+      for (const dropdown of dropdowns) {
+        try {
+          await page.evaluate(select => {
+            select.value = 'Yes';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+          }, dropdown);
+          console.log('✅ Selected "Yes" for dropdown');
+          await delay(300);
+        } catch (error) {
+          console.warn('⚠️ Failed to set dropdown value:', error.message);
+        }
+      }
+
+      // Handle required inputs
+      const inputs = await page.$$('form input[required]');
+
+      for (const input of inputs) {
+        const id = await input.evaluate(el => el.id);
+        const label = await page.evaluate((id) => {
+          const labelEl = document.querySelector(`label[for="${id}"]`);
+          return labelEl ? labelEl.innerText : '';
+        }, id);
+
+        if (!label) continue;
+
+        const fillValue = await decideInputValue(label, application);  // Note the await here
+
+        if (fillValue) {
+          await input.evaluate(el => el.value = '');
+          await input.focus();
+          await delay(100);
+          await input.type(fillValue.toString(), { delay: 20 });
+          console.log(`✅ Filled "${label}" with AI-generated response`);
+        }
+      }
+
+      // Wait for LinkedIn to process any input changes
+      await delay(1000);
+
+      // Check for buttons in order of form flow
+      const nextBtn = await page.$('button[aria-label="Continue to next step"]');
+      const reviewBtn = await page.$('button[aria-label="Review your application"]');
+      const submitBtn = await page.$('button[aria-label="Submit application"]');
+
+      if (nextBtn) {
+        await nextBtn.click();
+        console.log("➡️ Clicked 'Next'");
+        await delay(1500);
+        step++;
+        continue;
+      } else if (reviewBtn) {
+        await reviewBtn.click();
+        console.log("🔍 Clicked 'Review'");
+        await delay(1500);
+        step++;
+        continue;
+      } else if (submitBtn) {
+        await submitBtn.click();
+        console.log("✅ Clicked 'Submit Application'");
+        await delay(1500);
+        break;
+      } else {
+        console.log("⛔ No navigation buttons found. Possibly stuck.");
+        break;
+      }
+    }
+
+    console.log("🎉 Form filled and submitted.");
+    await delay(2000);
+      const dismissButton = await page.$('button[aria-label="Dismiss"][data-test-modal-close-btn]');
+      if (dismissButton) {
+        await dismissButton.click();
+        console.log("🔒 Closed success popup");
+        await delay(1000);
+      }
+    return true;
+
+
+  } catch (err) {
+    console.error("❌ Error filling form:", err.message);
+    return false;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Phone number: 'input[id*="phoneNumber-nationalNumber"]'
+location element selector: 'input[id*="location-GEO-LOCATION"]'
+next button: 'button[aria-label="Continue to next step"]'
+years of experience: 'input[type="text"][id*="numeric"]'
+submit application: 'button[aria-label="Submit application"]'
+city: 'input[id^="single-typeahead-entity-form-component"][id$="-city-HOME-CITY"]'

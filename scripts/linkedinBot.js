@@ -4,6 +4,12 @@ const { timeout } = require('puppeteer');
 const XLSX = require('xlsx');
 const path = require('path');
 
+const MAX_DAILY_APPLICATIONS = 50;
+const APPLICATION_TIMESTAMP_KEY = 'last_application_date';
+const DAILY_COUNT_KEY = 'daily_application_count';
+const MAX_FORM_FILL_TIME = 3 * 60 * 1000; // 3 minutes in milliseconds
+const MAX_STEPS = 10; // Maximum number of form steps before considering it a loop
+
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function typeWithSlowMotion(page, selector, text) {
@@ -60,46 +66,126 @@ async function searchJobs(page, jobTitle, jobLocation) {
 
 async function applyJobs(page, application) {
   try {
-    // Get all job 
-    const jobItems = await page.$$('li.occludable-update');
-    console.log(`Found ${jobItems.length} jobs`);
+    let applicationCount = 0;
 
-    for (let i = 0; i < jobItems.length; i++) {
-      try {
-        console.log(`Clicking job #${i + 1}`);
-        await jobItems[i].evaluate(node => {
-          const clickable = node.querySelector('a, button, [role="button"]') || node;
-          clickable.click();
-        });
-        await delay(2000);
+    while (true) {
+      // Check if we've hit the daily limit
+      if (applicationCount >= MAX_DAILY_APPLICATIONS) {
+        console.log(`📊 Reached daily limit of ${MAX_DAILY_APPLICATIONS} applications`);
+        break;
+      }
 
-        const applyButton = await page.waitForSelector('button#jobs-apply-button-id', {
-          visible: true,
-          timeout: 10000
-        });
+      const jobItems = await page.$$('li.occludable-update');
+      console.log(`Found ${jobItems.length} total jobs on current page`);
 
-        if (applyButton) {
-          console.log('Easy Apply button found, clicking it');
-          await applyButton.click();
+      // Process jobs on current page
+      for (let i = 0; i < jobItems.length; i++) {
+        try {
+          // Check if job has already been applied to
+          const isApplied = await jobItems[i].evaluate(node => {
+            const footerText = node.querySelector('.job-card-container__footer-item')?.textContent?.trim();
+            return footerText === 'Applied';
+          });
 
+          if (isApplied) {
+            console.log(`⏩ Skipping job #${i + 1} - already applied`);
+            continue;
+          }
+
+          // Scroll job into view before clicking
+          await page.evaluate(element => {
+            element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, jobItems[i]);
+          
+          await delay(1000);
+
+          console.log(`Clicking job #${i + 1}`);
+          await jobItems[i].evaluate(node => {
+            const clickable = node.querySelector('a, button, [role="button"]') || node;
+            clickable.click();
+          });
           await delay(2000);
 
-        const success = await fillForm(page, application);
+          const applyButton = await page.waitForSelector('button#jobs-apply-button-id', {
+            visible: true,
+            timeout: 10000
+          });
 
-        if (success) {
+          if (applyButton) {
+            console.log('Easy Apply button found, clicking it');
+            await applyButton.click();
+            await delay(2000);
+
+            const formFillTimeout = new Promise((resolve) => {
+              setTimeout(() => {
+                resolve(false);
+              }, MAX_FORM_FILL_TIME);
+            });
+
+            const formResult = await Promise.race([
+              fillForm(page, application),
+              formFillTimeout
+            ]);
+
+            if (!formResult) {
+              console.log("⚠️ Application abandoned due to timeout or error");
+              
+              // Try to close any open dialogs
+              try {
+                const closeButton = await page.$('button[aria-label="Dismiss"]');
+                if (closeButton) {
+                  await closeButton.click();
+                  console.log("🔒 Closed application dialog");
+                }
+              } catch (closeError) {
+                console.warn("Could not close dialog:", closeError.message);
+              }
+              
+              continue;
+            }
+
             console.log("✅ Application submitted successfully.");
-        } else {
-            console.log("⚠️ Application failed/skipped.");
-        }
-        }
+            applicationCount++;
+            console.log(`📈 Application count: ${applicationCount}/${MAX_DAILY_APPLICATIONS}`);
+          }
 
-      } catch (error) {
-        console.warn(`Error processing job #${i + 1}:`, error.message);
-        continue;
+        } catch (error) {
+          console.warn(`Error processing job #${i + 1}:`, error.message);
+          continue;
+        }
+      }
+
+      // After processing all jobs on current page, handle pagination
+      try {
+        // Find current page number
+        const currentPage = await page.$eval('.artdeco-pagination__indicator--number.active.selected button span', 
+          el => parseInt(el.textContent));
+        console.log(`Currently on page ${currentPage}`);
+
+        // Look for next page button
+        const nextPageBtn = await page.$(`[data-test-pagination-page-btn="${currentPage + 1}"]`);
+        
+        if (nextPageBtn) {
+          console.log(`Moving to page ${currentPage + 1}`);
+          await nextPageBtn.click();
+          await delay(3000); // Wait for new page to load
+          
+          // Wait for job list to refresh
+          await page.waitForSelector('li.occludable-update', {
+            visible: true,
+            timeout: 10000
+          });
+        } else {
+          console.log('No more pages to process');
+          break;
+        }
+      } catch (paginationError) {
+        console.log('No more pages or pagination error:', paginationError.message);
+        break;
       }
     }
 
-    console.log('All jobs processed');
+    console.log('Completed processing all available pages');
 
   } catch (error) {
     console.error('Error in applyJobs:', error);
@@ -133,7 +219,7 @@ function decideInputValue(label, application) {
   if (label.includes('salary')) return application.expected_ctc;
   if (label.includes('total experience')) return application.total_experience;
   if (label.includes('relevant experience')) return application.relevant_experience;
-  if (label.includes('notice period')) return application.notice_period;
+  if (label.includes('notice period')) return '1';
   if (label.includes('notice')) return application.notice_period;
   if (label.includes('linkedin')) return application.linkedin_url;
   if (label.includes('linkedin profile')) return application.linkedin_url;
@@ -141,6 +227,19 @@ function decideInputValue(label, application) {
   if (label.includes('onsite')) return 'Yes';
   if (label.includes('remote')) return 'Yes';
   if (label.includes('hybrid')) return 'Yes';
+  if (label.includes('from scale 1 to 10')) return '10';
+  if (label.includes('from 1 to 10')) return '10';
+  if (label.includes('from 1-10')) return '10';
+  if (label.includes('from 1 to 5')) return '5';
+  if (label.includes('from 1-5')) return '5';
+  if (label.includes('from 1 to 3')) return '3';
+  if (label.includes('from 1-3')) return '3';
+  if (label.includes('from 1 to 2')) return '2';
+  if (label.includes('from 1-2')) return '2';
+  if (label.includes('What is your notice period? (Please mention the exact duration in months)')) return '0';
+  if (label.includes('Notice Period')) return '0';
+  if (label.includes('grade') || label.includes('cgpa') || label.includes('4.0 scale') || label.includes('marks')) return '4.0';
+  if (label.includes('grade') || label.includes('cgpa') || label.includes('5.0 scale') || label.includes('marks')) return '5.0';
   if (label.includes('email')) return null;
 
   // Fallbacks
@@ -150,6 +249,7 @@ function decideInputValue(label, application) {
   if (label.includes('authorized') || label.includes('eligible') || label.includes('sponsorship')) return 'Yes';
   if (label.includes('currently working') || label.includes('employed')) return 'Yes';
   if (label.includes('willing') && label.includes('relocate')) return 'Yes';
+  if (label.includes("from scale 1 to 10")) 
 
   return 'N/A';
 }
@@ -159,8 +259,21 @@ async function fillForm(page, application) {
   try {
     console.log('📝 Starting to fill form...');
     let step = 1;
+    const startTime = Date.now();
 
     while (true) {
+      // Check for timeout
+      if (Date.now() - startTime > MAX_FORM_FILL_TIME) {
+        console.log('⚠️ Form fill timeout reached. Moving to next job...');
+        return false;
+      }
+
+      // Check for too many steps
+      if (step > MAX_STEPS) {
+        console.log('⚠️ Too many form steps. Possible loop detected. Moving to next job...');
+        return false;
+      }
+
       console.log(`🔁 Step ${step}...`);
 
       // Handle radio buttons first - Always select "Yes"
@@ -237,23 +350,62 @@ async function fillForm(page, application) {
         await submitBtn.click();
         console.log("✅ Clicked 'Submit Application'");
         await delay(1500);
+
+        // Verify successful submission
+        try {
+          const successIndicator = await page.waitForSelector('.jobs-s-apply--fadein .artdeco-inline-feedback--success', {
+            visible: true,
+            timeout: 5000
+          });
+
+          const appliedText = await successIndicator.$eval('.artdeco-inline-feedback__message', el => el.textContent.trim());
+          
+          if (appliedText.includes('Applied')) {
+            console.log("✅ Application confirmed successful!");
+
+            // Get job details
+            const jobTitle = await page.$eval('.job-details-jobs-unified-top-card__job-title a', el => el.textContent.trim());
+            const jobUrl = page.url();
+            const companyName = await page.$eval('.job-details-jobs-unified-top-card__company-name a', el => el.textContent.trim());
+
+            // Log to Supabase with correct user_id
+            const { error } = await supabase
+              .from('job_applications')
+              .insert({
+                user_id: application.user_id, // Changed from application.id to application.user_id
+                job_title: jobTitle,
+                job_url: jobUrl,
+                company_name: companyName
+              });
+
+            if (error) {
+              console.error("Failed to log application:", error);
+            } else {
+              console.log("📝 Application logged to database");
+            }
+          }
+        } catch (verificationError) {
+          console.warn("⚠️ Could not verify application success:", verificationError.message);
+        }
+
+        // Close success popup if present
+        const dismissButton = await page.$('button[aria-label="Dismiss"][data-test-modal-close-btn]');
+        if (dismissButton) {
+          await dismissButton.click();
+          console.log("🔒 Closed success popup");
+          await delay(1000);
+        }
+
         break;
       } else {
-        console.log("⛔ No navigation buttons found. Possibly stuck.");
-        break;
+        console.log("⛔ No navigation buttons found. Abandoning application.");
+        return false;
       }
     }
 
     console.log("🎉 Form filled and submitted.");
     await delay(2000);
-      const dismissButton = await page.$('button[aria-label="Dismiss"][data-test-modal-close-btn]');
-      if (dismissButton) {
-        await dismissButton.click();
-        console.log("🔒 Closed success popup");
-        await delay(1000);
-      }
     return true;
-
 
   } catch (err) {
     console.error("❌ Error filling form:", err.message);
@@ -268,26 +420,45 @@ async function getApplicationData() {
     const worksheet = workbook.Sheets[sheetName];
     const applications = XLSX.utils.sheet_to_json(worksheet);
 
-    const application = applications.find(app => 
+    // Filter only applications with LinkedIn credentials
+    return applications.filter(app => 
       app.linkedin_email && 
       app.linkedin_password
     );
-
-    if (!application) {
-      throw new Error('No application with LinkedIn credentials found');
-    }
-
-    return application;
   } catch (error) {
     console.error('Error reading Excel file:', error);
     throw error;
   }
 }
 
-async function loginToLinkedin() {
+async function checkDailyLimit(userId) {
   try {
-    const application = await getApplicationData();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
 
+    const { data, error } = await supabase
+      .from('job_applications')
+      .select('id')
+      .eq('user_id', userId)
+      .gte('applied_at', todayStart.toISOString());
+
+    if (error) {
+      console.error('Error checking daily limit:', error);
+      return true; // Allow application if we can't check the limit
+    }
+
+    const applicationCount = data?.length || 0;
+    console.log(`📊 User has submitted ${applicationCount} applications today`);
+    
+    return applicationCount < MAX_DAILY_APPLICATIONS;
+  } catch (err) {
+    console.error('Failed to check daily limit:', err);
+    return true; // Allow application if check fails
+  }
+}
+
+async function loginToLinkedin(application) {
+  try {
     const browser = await puppeteer.launch({
       headless: false,
       slowMo: 50,
@@ -350,7 +521,38 @@ async function loginToLinkedin() {
   }
 }
 
-// Runs the script
-loginToLinkedin()
-  .then(() => console.log('Login process completed successfully'))
+async function processAllUsers() {
+  try {
+    const applications = await getApplicationData();
+    console.log(`Found ${applications.length} users to process`);
+
+    for (const application of applications) {
+      console.log(`\n📝 Processing user: ${application.first_name} ${application.last_name}`);
+
+      // Check daily application limit
+      const canApply = await checkDailyLimit(application.user_id);
+      if (!canApply) {
+        console.log(`⚠️ User ${application.first_name} has reached daily limit of ${MAX_DAILY_APPLICATIONS} applications`);
+        continue;
+      }
+
+      try {
+        await loginToLinkedin(application);
+        console.log(`✅ Completed processing for ${application.first_name}`);
+        await delay(5000); // Wait between users
+      } catch (error) {
+        console.error(`❌ Error processing user ${application.first_name}:`, error);
+        continue;
+      }
+    }
+
+    console.log('\n🎉 Completed processing all users');
+  } catch (error) {
+    console.error('Failed to process users:', error);
+  }
+}
+
+// Update the script execution
+processAllUsers()
+  .then(() => console.log('All users processed successfully'))
   .catch(error => console.error('Script failed:', error));
