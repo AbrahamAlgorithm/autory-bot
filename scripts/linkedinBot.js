@@ -10,8 +10,8 @@ const openai = new OpenAI({
 });
 const fs = require('fs').promises;
 
-// Add these constants at the top
-const USER_DATA_DIR = path.join(__dirname, '..', 'user-data');
+// Change USER_DATA_DIR to COOKIES_DIR
+const COOKIES_DIR = path.join(__dirname, '..', 'cookies');
 
 const MAX_DAILY_APPLICATIONS = 50;
 const APPLICATION_TIMESTAMP_KEY = 'last_application_date';
@@ -29,44 +29,60 @@ async function typeWithSlowMotion(page, selector, text) {
   }
 }
 
-async function cleanupOldSessions() {
+// Replace setupUserSession with saveCookies and loadCookies functions
+async function saveCookies(page, userId) {
   try {
-    const MAX_SESSION_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
-    const dirs = await fs.readdir(USER_DATA_DIR);
+    const cookiesPath = path.join(COOKIES_DIR, `${userId}.json`);
+    const cookies = await page.cookies();
+    await fs.writeFile(cookiesPath, JSON.stringify(cookies, null, 2));
+    console.log('📝 Saved cookies for user');
+  } catch (error) {
+    console.error('Failed to save cookies:', error);
+  }
+}
+
+async function loadCookies(page, userId) {
+  try {
+    const cookiesPath = path.join(COOKIES_DIR, `${userId}.json`);
+    const cookiesString = await fs.readFile(cookiesPath);
+    const cookies = JSON.parse(cookiesString);
+    await page.setCookie(...cookies);
+    console.log('🔄 Loaded existing cookies');
+    return true;
+  } catch (error) {
+    console.log('No existing cookies found');
+    return false;
+  }
+}
+
+// Modify the cleanupOldSessions function
+async function cleanupOldCookies() {
+  try {
+    const MAX_COOKIE_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
+    const files = await fs.readdir(COOKIES_DIR);
     
-    for (const dir of dirs) {
-      const dirPath = path.join(USER_DATA_DIR, dir);
-      const stats = await fs.stat(dirPath);
+    for (const file of files) {
+      const filePath = path.join(COOKIES_DIR, file);
+      const stats = await fs.stat(filePath);
       
-      if (Date.now() - stats.mtime.getTime() > MAX_SESSION_AGE) {
-        await fs.rm(dirPath, { recursive: true, force: true });
-        console.log(`Cleaned up old session for user: ${dir}`);
+      if (Date.now() - stats.mtime.getTime() > MAX_COOKIE_AGE) {
+        await fs.unlink(filePath);
+        console.log(`Cleaned up old cookies for: ${file}`);
       }
     }
   } catch (error) {
-    console.warn('Failed to cleanup old sessions:', error.message);
+    console.warn('Failed to cleanup old cookies:', error.message);
   }
 }
 
-// function to manage user sessions
-async function setupUserSession(userId) {
-  const userDir = path.join(USER_DATA_DIR, userId.toString());
-  try {
-    await fs.mkdir(userDir, { recursive: true });
-    return userDir;
-  } catch (error) {
-    console.error(`Failed to create user directory: ${error.message}`);
-    throw error;
-  }
-}
-
+// Modify the processAllUsers function
 async function processAllUsers() {
   try {
     const applications = await getApplicationData();
     console.log(`Found ${applications.length} users to process`);
 
-    // Create base user-data directory if it doesn't exist
-    await fs.mkdir(USER_DATA_DIR, { recursive: true });
+    // Create cookies directory if it doesn't exist
+    await fs.mkdir(COOKIES_DIR, { recursive: true });
 
     for (const application of applications) {
       console.log(`\n📝 Processing user: ${application.first_name} ${application.last_name}`);
@@ -80,63 +96,60 @@ async function processAllUsers() {
 
       let browser;
       try {
-        const userDataDir = await setupUserSession(application.user_id);
+        browser = await puppeteer.launch({
+          headless: "new",
+          defaultViewport: {
+            width: 1920,
+            height: 1080
+          },
+          args: [
+            '--window-size=1920,1080',
+            '--disable-notifications',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+            '--start-maximized'
+          ]
+        });
 
-        const processingPromise = (async () => {
-          browser = await puppeteer.launch({
-            headless: "new",
-            defaultViewport: {
-              width: 1920,
-              height: 1080
-            },
-            args: [
-              '--window-size=1920,1080',
-              '--disable-notifications',
-              '--no-sandbox',
-              '--disable-setuid-sandbox',
-              '--disable-dev-shm-usage',
-              '--disable-accelerated-2d-canvas',
-              '--disable-gpu',
-              '--start-maximized'
-            ],
-            userDataDir: userDataDir
+        const page = await browser.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+
+        // Try to load existing cookies
+        await loadCookies(page, application.user_id);
+
+        // Check if already logged in
+        try {
+          await page.goto('https://www.linkedin.com/feed/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
           });
-
-          const page = await browser.newPage();
-          await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
           
-          // Check if already logged in
-          try {
-            await page.goto('https://www.linkedin.com/feed/', {
-              waitUntil: 'networkidle0',
-              timeout: 30000
-            });
-            
-            // Check if we're already logged in
-            const isLoggedIn = await page.$('.global-nav__content');
-            if (!isLoggedIn) {
-              console.log('No active session found, logging in...');
-              await loginToLinkedin(application, page);
-            } else {
-              console.log('Found existing session, skipping login...');
-            }
-          } catch (error) {
+          const isLoggedIn = await page.$('.global-nav__content');
+          if (!isLoggedIn) {
             console.log('No active session found, logging in...');
             await loginToLinkedin(application, page);
+            // Save cookies after successful login
+            await saveCookies(page, application.user_id);
+          } else {
+            console.log('Found existing session, skipping login...');
           }
+
+          console.log('Navigating to Jobs page...');
+          await page.click('a[href="https://www.linkedin.com/jobs/?"]');
+          await delay(10000);
+          console.log('Jobs page loaded successfully!');
 
           await searchJobs(page, application.job_title, application.job_location);
           await applyJobs(page, application);
-        })();
 
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => {
-            reject(new Error('User processing timeout reached (30 minutes)'));
-          }, MAX_USER_PROCESSING_TIME);
-        });
-
-        await Promise.race([processingPromise, timeoutPromise]);
-        console.log(`✅ Completed processing for ${application.first_name}`);
+        } catch (error) {
+          console.error('Session error:', error);
+          await loginToLinkedin(application, page);
+          await saveCookies(page, application.user_id);
+        }
 
       } catch (error) {
         if (error.message.includes('timeout reached')) {
@@ -775,5 +788,5 @@ async function loginToLinkedin(application, page) {
 
 module.exports = {
   processAllUsers,
-  cleanupOldSessions
+  cleanupOldCookies
 };
