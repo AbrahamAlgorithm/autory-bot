@@ -8,6 +8,10 @@ const OpenAI = require('openai');
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
+const fs = require('fs').promises;
+
+// Add these constants at the top
+const USER_DATA_DIR = path.join(__dirname, '..', 'user-data');
 
 const MAX_DAILY_APPLICATIONS = 50;
 const APPLICATION_TIMESTAMP_KEY = 'last_application_date';
@@ -25,10 +29,44 @@ async function typeWithSlowMotion(page, selector, text) {
   }
 }
 
+async function cleanupOldSessions() {
+  try {
+    const MAX_SESSION_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
+    const dirs = await fs.readdir(USER_DATA_DIR);
+    
+    for (const dir of dirs) {
+      const dirPath = path.join(USER_DATA_DIR, dir);
+      const stats = await fs.stat(dirPath);
+      
+      if (Date.now() - stats.mtime.getTime() > MAX_SESSION_AGE) {
+        await fs.rm(dirPath, { recursive: true, force: true });
+        console.log(`Cleaned up old session for user: ${dir}`);
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to cleanup old sessions:', error.message);
+  }
+}
+
+// function to manage user sessions
+async function setupUserSession(userId) {
+  const userDir = path.join(USER_DATA_DIR, userId.toString());
+  try {
+    await fs.mkdir(userDir, { recursive: true });
+    return userDir;
+  } catch (error) {
+    console.error(`Failed to create user directory: ${error.message}`);
+    throw error;
+  }
+}
+
 async function processAllUsers() {
   try {
     const applications = await getApplicationData();
     console.log(`Found ${applications.length} users to process`);
+
+    // Create base user-data directory if it doesn't exist
+    await fs.mkdir(USER_DATA_DIR, { recursive: true });
 
     for (const application of applications) {
       console.log(`\n📝 Processing user: ${application.first_name} ${application.last_name}`);
@@ -42,9 +80,11 @@ async function processAllUsers() {
 
       let browser;
       try {
+        const userDataDir = await setupUserSession(application.user_id);
+
         const processingPromise = (async () => {
           browser = await puppeteer.launch({
-            headless: "new", // Use new headless mode
+            headless: "new",
             defaultViewport: {
               width: 1920,
               height: 1080
@@ -58,16 +98,36 @@ async function processAllUsers() {
               '--disable-accelerated-2d-canvas',
               '--disable-gpu',
               '--start-maximized'
-            ]
+            ],
+            userDataDir: userDataDir
           });
+
           const page = await browser.newPage();
-          
-          // Set user agent to avoid detection
           await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
           
-          await loginToLinkedin(application, page);
-        })();
+          // Check if already logged in
+          try {
+            await page.goto('https://www.linkedin.com/feed/', {
+              waitUntil: 'networkidle0',
+              timeout: 30000
+            });
+            
+            // Check if we're already logged in
+            const isLoggedIn = await page.$('.global-nav__content');
+            if (!isLoggedIn) {
+              console.log('No active session found, logging in...');
+              await loginToLinkedin(application, page);
+            } else {
+              console.log('Found existing session, skipping login...');
+            }
+          } catch (error) {
+            console.log('No active session found, logging in...');
+            await loginToLinkedin(application, page);
+          }
 
+          await searchJobs(page, application.job_title, application.job_location);
+          await applyJobs(page, application);
+        })();
 
         const timeoutPromise = new Promise((_, reject) => {
           setTimeout(() => {
@@ -651,7 +711,29 @@ async function checkDailyLimit(userId) {
 
 async function loginToLinkedin(application, page) {
   try {
-    console.log('Navigating to LinkedIn...');
+    console.log('Checking for existing session...');
+
+    // Check if already logged in by looking for nav content
+    const isLoggedIn = await page.$('.global-nav__content');
+    
+    if (isLoggedIn) {
+      console.log('✅ Existing session found, skipping login...');
+      
+      console.log('Navigating to Jobs page...');
+      await page.waitForSelector('a[href="https://www.linkedin.com/jobs/?"]', {
+        visible: true,
+        timeout: 30000
+      });
+      
+      await page.click('a[href="https://www.linkedin.com/jobs/?"]');
+      await delay(10000);
+      console.log('Jobs page loaded successfully!');
+      
+      return; // Exit function if already logged in
+    }
+
+    // If not logged in, proceed with login
+    console.log('No active session, proceeding with login...');
     await page.goto('https://www.linkedin.com/login', {
       waitUntil: 'networkidle0'
     });
@@ -666,7 +748,8 @@ async function loginToLinkedin(application, page) {
 
     console.log('Clicking sign in...');
     await page.click('button[type="submit"]');
-    console.log('Waiting for successful login...');
+    
+    // Wait for successful login
     await page.waitForSelector('.global-nav__content', {
       visible: true,
       timeout: 60000
@@ -674,26 +757,15 @@ async function loginToLinkedin(application, page) {
     
     console.log('Successfully logged in!');
     await delay(2000);
-    console.log('Navigating to Jobs page...');
-    await page.waitForSelector('a[href="https://www.linkedin.com/jobs/?"]', {
-      visible: true,
-      timeout: 30000
-    });
-    
-    await page.click('a[href="https://www.linkedin.com/jobs/?"]');
 
-    console.log('Waiting for Jobs page to load...');
+    // Navigate to jobs page
+    console.log('Navigating to Jobs page...');
+    await page.click('a[href="https://www.linkedin.com/jobs/?"]');
     await delay(10000);
-    
     console.log('Jobs page loaded successfully!');
 
-    await searchJobs(page, application.job_title, application.job_location);
-
-    console.log('Starting job applications...');
-    await applyJobs(page, application);  // Pass application data
-
   } catch (error) {
-    console.error('Operation failed:', error);
+    console.error('Login operation failed:', error);
     if (error.name === 'TimeoutError') {
       console.log('Timeout while waiting for element. Please check if the page loaded correctly.');
     }
@@ -702,5 +774,6 @@ async function loginToLinkedin(application, page) {
 }
 
 module.exports = {
-  processAllUsers
+  processAllUsers,
+  cleanupOldSessions
 };
